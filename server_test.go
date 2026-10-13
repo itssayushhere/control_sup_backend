@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -244,5 +246,110 @@ func TestUnknownPermRejected(t *testing.T) {
 	a.write(out{"type": "consent", "requestId": rid, "accept": true, "perms": []string{"view"}})
 	if p := fmt.Sprint(b.read("session")["perms"]); p != "[view]" {
 		t.Fatalf("got %s", p)
+	}
+}
+
+// trustB makes a trust b: A saves a secret and accepts one code visit with "trust" ticked.
+func trustB(a, b *tclient, secret string) {
+	a.write(out{"type": "set_secret", "secret": secret})
+	a.read("secret_set")
+	b.write(out{"type": "connect", "to": a.id, "code": a.newCode()})
+	a.write(out{"type": "consent", "requestId": a.read("incoming")["requestId"], "accept": true, "trust": true})
+	sid := b.read("session")["sessionId"]
+	a.read("session")
+	b.write(out{"type": "end", "sessionId": sid})
+	b.read("ended")
+	a.read("ended")
+}
+
+func TestWrongSecretsRemoveTrust(t *testing.T) {
+	_, url, _ := testServer(t)
+	a, b := device(t, url), device(t, url)
+	trustB(a, b, "correct horse")
+
+	for i := 0; i < maxSecretGuesses; i++ {
+		b.write(out{"type": "connect", "to": a.id, "secret": "wrong guess"})
+		if r := b.read("rejected"); r["reason"] != "denied" {
+			t.Fatalf("guess %d: %v", i, r)
+		}
+	}
+	if u := a.read("untrusted"); u["deviceId"] != b.id || u["reason"] != "wrong secret" {
+		t.Fatalf("A not told: %v", u)
+	}
+	// Trust is gone, so even the right secret no longer works.
+	b.write(out{"type": "connect", "to": a.id, "secret": "correct horse"})
+	b.read("rejected")
+}
+
+func TestRightSecretResetsWrongCount(t *testing.T) {
+	_, url, _ := testServer(t)
+	a, b := device(t, url), device(t, url)
+	trustB(a, b, "correct horse")
+	for round := 0; round < 2; round++ {
+		for i := 0; i < maxSecretGuesses-1; i++ {
+			b.write(out{"type": "connect", "to": a.id, "secret": "typo typo"})
+			b.read("rejected")
+		}
+		b.write(out{"type": "connect", "to": a.id, "secret": "correct horse"})
+		a.read("incoming") // still trusted: the typos never reached the limit in a row
+		sid := b.read("session")["sessionId"]
+		a.read("session")
+		b.write(out{"type": "end", "sessionId": sid})
+		b.read("ended")
+		a.read("ended")
+	}
+}
+
+func TestUntrustEndsSessionAndReplies(t *testing.T) {
+	_, url, _ := testServer(t)
+	a, b := device(t, url), device(t, url)
+	trustB(a, b, "correct horse")
+	b.write(out{"type": "connect", "to": a.id, "secret": "correct horse"})
+	a.read("incoming")
+	sid := a.read("session")["sessionId"]
+	b.read("session")
+
+	a.write(out{"type": "untrust", "deviceId": b.id})
+	if e := a.read("ended"); e["sessionId"] != sid {
+		t.Fatalf("got %v", e)
+	}
+	if u := a.read("untrusted"); u["deviceId"] != b.id {
+		t.Fatalf("got %v", u)
+	}
+	b.read("ended")
+	b.write(out{"type": "connect", "to": a.id, "secret": "correct horse"})
+	b.read("rejected")
+}
+
+func TestVisitorLeavingCancelsPrompt(t *testing.T) {
+	_, url, _ := testServer(t)
+	a, b := device(t, url), device(t, url)
+	b.write(out{"type": "connect", "to": a.id, "code": a.newCode()})
+	rid := a.read("incoming")["requestId"]
+	b.conn.Close(websocket.StatusNormalClosure, "")
+	if c := a.read("cancelled"); c["requestId"] != rid {
+		t.Fatalf("got %v", c)
+	}
+}
+
+func TestSessionCarriesTurnCredentials(t *testing.T) {
+	h, url, _ := testServer(t)
+	h.mu.Lock()
+	h.iceURLs, h.turnSecret = []string{"turn:turn.example.com:3478"}, "s3cret"
+	h.mu.Unlock()
+	a, b := device(t, url), device(t, url)
+	b.write(out{"type": "connect", "to": a.id, "code": a.newCode()})
+	a.write(out{"type": "consent", "requestId": a.read("incoming")["requestId"], "accept": true})
+	a.read("session")
+	ice := b.read("session")["iceServers"].([]any)[0].(map[string]any)
+	user := ice["username"].(string)
+	if !strings.HasSuffix(user, ":"+b.id) {
+		t.Fatalf("bad username %q", user)
+	}
+	// coturn recomputes exactly this from its static-auth-secret.
+	mac := hmac.New(sha1.New, []byte("s3cret"))
+	mac.Write([]byte(user))
+	if ice["credential"] != base64.StdEncoding.EncodeToString(mac.Sum(nil)) {
+		t.Fatalf("bad credential %v", ice)
 	}
 }

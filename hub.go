@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -18,9 +21,12 @@ import (
 )
 
 const (
-	codeTTL        = 10 * time.Minute
-	maxCodeGuesses = 5 // wrong guesses from any device before the code is replaced
-	minSecret      = 8
+	codeTTL          = 10 * time.Minute
+	maxCodeGuesses   = 5 // wrong guesses from any device before the code is replaced
+	maxSecretGuesses = 5 // wrong secrets from one trusted device before A stops trusting it
+	minSecret        = 8
+	// shortcut: coturn rejects these after 24h, so a call running longer can't refresh its TURN relay; send fresh creds mid-session if that matters.
+	turnTTL = 24 * time.Hour
 )
 
 // knownPerms are the powers A can grant a connecting device. A's own client enforces them.
@@ -101,16 +107,21 @@ type hub struct {
 	codes    map[string]*oneTimeCode // target device ID -> its current code
 	pending  map[string]*request
 	sessions map[string]*session
+	// shortcut: in memory, so a restart resets the count; fine at 5 tries per restart, persist if abused.
+	secretWrong map[string]int // "owner peer" -> wrong secrets in a row
+	iceURLs     []string       // STUN/TURN URLs handed to both sides at session start
+	turnSecret  string         // coturn static-auth-secret; empty = no TURN credentials
 }
 
 func newHub(st *store) *hub {
 	return &hub{
-		store:    st,
-		now:      time.Now,
-		clients:  map[string]*client{},
-		codes:    map[string]*oneTimeCode{},
-		pending:  map[string]*request{},
-		sessions: map[string]*session{},
+		store:       st,
+		now:         time.Now,
+		clients:     map[string]*client{},
+		codes:       map[string]*oneTimeCode{},
+		pending:     map[string]*request{},
+		sessions:    map[string]*session{},
+		secretWrong: map[string]int{},
 	}
 }
 
@@ -160,16 +171,19 @@ func (h *hub) unregister(c *client) {
 	}
 	for id, s := range h.sessions {
 		if s.a == c || s.b == c {
-			s.a.send(out{"type": "ended", "sessionId": id})
-			s.b.send(out{"type": "ended", "sessionId": id})
-			delete(h.sessions, id)
+			h.endSession(id, s)
 		}
 	}
 	for id, p := range h.pending {
-		if p.from == c || p.to == c {
+		switch c {
+		case p.to:
 			p.from.send(out{"type": "rejected", "reason": "unavailable"})
-			delete(h.pending, id)
+		case p.from: // visitor left: take the Allow prompt off A's screen
+			p.to.send(out{"type": "cancelled", "requestId": id})
+		default:
+			continue
 		}
+		delete(h.pending, id)
 	}
 }
 
@@ -199,9 +213,7 @@ func (h *hub) handle(c *client, m msg) {
 	case "end":
 		h.end(c, m)
 	case "untrust":
-		if err := h.store.untrust(c.id, m.DeviceID); err != nil {
-			log.Print(err)
-		}
+		h.untrust(c, m.DeviceID)
 	default:
 		c.send(out{"type": "error", "reason": "unknown type"})
 	}
@@ -218,9 +230,8 @@ func (h *hub) issueCode(c *client) {
 func (h *hub) connect(c *client, m msg) {
 	// Argon2 is slow on purpose, so check the secret before taking the lock.
 	var perms []string
-	secretOK := false
+	secretOK, trusted := false, false
 	if m.Secret != "" {
-		var trusted bool
 		perms, trusted = h.store.trustedPerms(m.To, c.id)
 		secretOK = trusted && h.store.checkSecret(m.To, m.Secret)
 	}
@@ -249,9 +260,13 @@ func (h *hub) connect(c *client, m msg) {
 		}
 	}
 	if !ok {
+		if m.Secret != "" && trusted {
+			h.wrongSecret(target, c)
+		}
 		c.send(out{"type": "rejected", "reason": "denied"}) // same reply for wrong code or secret
 		return
 	}
+	delete(h.secretWrong, m.To+" "+c.id)
 
 	if m.Secret != "" { // trusted device: no prompt, just tell the target who's in
 		target.send(out{"type": "incoming", "from": c.id, "needsConsent": false})
@@ -299,8 +314,56 @@ func (h *hub) startSession(initiator, other *client, perms []string) {
 	}
 	id := randomID()
 	h.sessions[id] = &session{initiator, other}
-	initiator.send(out{"type": "session", "sessionId": id, "peer": other.id, "initiator": true, "perms": perms})
-	other.send(out{"type": "session", "sessionId": id, "peer": initiator.id, "initiator": false, "perms": perms})
+	initiator.send(out{"type": "session", "sessionId": id, "peer": other.id, "initiator": true, "perms": perms, "iceServers": h.iceServers(initiator.id)})
+	other.send(out{"type": "session", "sessionId": id, "peer": initiator.id, "initiator": false, "perms": perms, "iceServers": h.iceServers(other.id)})
+}
+
+// iceServers is what a client passes to its RTCPeerConnection. TURN credentials follow
+// coturn's use-auth-secret scheme, so coturn can check them with no per-user setup. Caller holds h.mu.
+func (h *hub) iceServers(id string) []out {
+	if len(h.iceURLs) == 0 {
+		return []out{}
+	}
+	s := out{"urls": h.iceURLs}
+	if h.turnSecret != "" {
+		user := fmt.Sprintf("%d:%s", h.now().Add(turnTTL).Unix(), id)
+		mac := hmac.New(sha1.New, []byte(h.turnSecret))
+		mac.Write([]byte(user))
+		s["username"], s["credential"] = user, base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	}
+	return []out{s}
+}
+
+// wrongSecret counts a bad secret from a device target trusts. Only trusted devices get here,
+// so a per-pair count can't be dodged with new keypairs. Caller holds h.mu.
+func (h *hub) wrongSecret(target, c *client) {
+	key := target.id + " " + c.id
+	if h.secretWrong[key]++; h.secretWrong[key] < maxSecretGuesses {
+		return
+	}
+	delete(h.secretWrong, key)
+	if err := h.store.untrust(target.id, c.id); err != nil {
+		log.Print(err)
+		return
+	}
+	target.send(out{"type": "untrusted", "deviceId": c.id, "reason": "wrong secret"})
+}
+
+// untrust forgets peer, ends any session c has with it, and confirms.
+func (h *hub) untrust(c *client, peer string) {
+	if err := h.store.untrust(c.id, peer); err != nil {
+		log.Print(err)
+		c.send(out{"type": "error", "reason": "internal"})
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for id, s := range h.sessions {
+		if (s.a == c && s.b.id == peer) || (s.b == c && s.a.id == peer) {
+			h.endSession(id, s)
+		}
+	}
+	c.send(out{"type": "untrusted", "deviceId": peer})
 }
 
 // signal relays SDP/ICE only between the two members of an active session.
@@ -330,9 +393,14 @@ func (h *hub) end(c *client, m msg) {
 	if s == nil || (s.a != c && s.b != c) {
 		return
 	}
-	delete(h.sessions, m.SessionID)
-	s.a.send(out{"type": "ended", "sessionId": m.SessionID})
-	s.b.send(out{"type": "ended", "sessionId": m.SessionID})
+	h.endSession(m.SessionID, s)
+}
+
+// endSession forgets a session and tells both sides. Caller holds h.mu.
+func (h *hub) endSession(id string, s *session) {
+	delete(h.sessions, id)
+	s.a.send(out{"type": "ended", "sessionId": id})
+	s.b.send(out{"type": "ended", "sessionId": id})
 }
 
 func randomID() string {

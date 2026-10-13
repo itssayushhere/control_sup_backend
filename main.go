@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 )
 
 func main() {
@@ -14,8 +15,17 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("signaling server listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, newServer(newHub(st))))
+	h := newHub(st)
+	h.iceURLs = strings.Fields(strings.ReplaceAll(os.Getenv("ICE_URLS"), ",", " "))
+	h.turnSecret = os.Getenv("TURN_SECRET")
+	srv := newServer(h)
+
+	if cert := os.Getenv("TLS_CERT"); cert != "" {
+		log.Printf("signaling server listening on %s (wss)", addr)
+		log.Fatal(http.ListenAndServeTLS(addr, cert, os.Getenv("TLS_KEY"), srv))
+	}
+	log.Printf("signaling server listening on %s (plain ws: put a TLS proxy in front, or set TLS_CERT/TLS_KEY)", addr)
+	log.Fatal(http.ListenAndServe(addr, srv))
 }
 
 // newServer wires the HTTP routes. Tests reuse it with httptest.
